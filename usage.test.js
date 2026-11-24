@@ -24,7 +24,7 @@ function panel(columns = 96, rows = 30) {
       ? { spawn() { throw new Error("Rendering must not launch a CLI"); } } : require(name),
     module: { exports: {} },
     process: {
-      env: { PATH: "" }, platform: process.platform,
+      env: { PATH: "", HERDR_USAGE_BIN_DIRS: "" }, platform: process.platform,
       stdout: { isTTY: true, columns, rows, write(chunk) { output = chunk; } },
       stdin: { isTTY: false },
     },
@@ -177,7 +177,7 @@ test("panels only create CLI cards for executables on Herdr's PATH", () => {
   fs.writeFileSync(path.join(directory, command), "");
   const context = vm.createContext({
     require: (name) => name === "node:child_process" ? { spawn() {} } : require(name),
-    module: {}, process: { env: { PATH: directory }, platform: process.platform,
+    module: {}, process: { env: { PATH: directory, PATHEXT: process.env.PATHEXT, HERDR_USAGE_BIN_DIRS: "" }, platform: process.platform,
       stdout: { isTTY: false }, stdin: { isTTY: false } },
     setInterval() { throw new Error("Importing the renderer must not start polling"); }, setTimeout, clearTimeout,
   });
@@ -195,7 +195,7 @@ test("OMP and Claude section names match the keys used by quota refresh", () => 
   for (const command of ["codex", "omp", "claude"]) fs.writeFileSync(path.join(directory, command + extension), "");
   const context = vm.createContext({
     require: (name) => name === "node:child_process" ? { spawn() {} } : require(name),
-    module: {}, process: { env: { PATH: directory }, platform: process.platform,
+    module: {}, process: { env: { PATH: directory, PATHEXT: process.env.PATHEXT, HERDR_USAGE_BIN_DIRS: "" }, platform: process.platform,
       stdout: { isTTY: false }, stdin: { isTTY: false } },
     setInterval() { throw new Error("Importing the renderer must not start polling"); }, setTimeout, clearTimeout,
   });
@@ -265,7 +265,7 @@ test("Codex keeps a reported plan when the quota request times out", async () =>
   } };
   let deadline;
   const context = vm.createContext({ require: (name) => name === "node:child_process" ? { spawn: () => child } : require(name),
-    module: {}, process: { env: { PATH: "" }, platform: "win32", stdout: { isTTY: false } },
+    module: {}, process: { env: { PATH: "", HERDR_USAGE_BIN_DIRS: "" }, platform: "win32", stdout: { isTTY: false } },
     setTimeout(callback) { deadline = callback; return 42; }, clearTimeout() {},
   });
   vm.runInContext(source, context);
@@ -292,7 +292,7 @@ test("Claude bridge mode writes a sanitized snapshot without starting polling", 
   } : name === "node:child_process" ? { spawn() { throw new Error("Bridge must not query a CLI"); } } : require(name);
   bridgeRequire.main = bridgeModule;
   const context = vm.createContext({ require: bridgeRequire, module: bridgeModule,
-    process: { env: { PATH: "" }, platform: process.platform, argv: ["node", "usage.js", "--claude-statusline"],
+    process: { env: { PATH: "", HERDR_USAGE_BIN_DIRS: "" }, platform: process.platform, argv: ["node", "usage.js", "--claude-statusline"],
       stdin: input, stdout: { isTTY: false, write(chunk) { output += chunk; } } },
     setInterval() { throw new Error("Bridge must not start polling"); }, setTimeout, clearTimeout,
   });
@@ -345,7 +345,7 @@ test("interactive startup uses one refresh timer and restores the terminal on cl
     isTTY: true, columns: 80, rows: 24, write(chunk) { writes.push(chunk); },
   });
   const fakeProcess = Object.assign(new EventEmitter(), {
-    env: { PATH: "" }, platform: process.platform, stdin: input, stdout: output,
+    env: { PATH: "", HERDR_USAGE_BIN_DIRS: "" }, platform: process.platform, stdin: input, stdout: output,
     exit(code) { assert.equal(code, 0); this.emit("exit"); },
   });
   let timers = 0;

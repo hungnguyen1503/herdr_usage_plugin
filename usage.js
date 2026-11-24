@@ -40,8 +40,14 @@ const AI_TOOLS = [
   { id: "ollama", name: "Ollama", command: "ollama", note: ["Yerel model aracı; kota adaptörü yok", "Local model tool; no quota adapter", "Modelos locales; sin adaptador de cuota"] },
 ];
 
+// Herdr servers often run with a bare PATH (no ~/.local/bin), so the usual
+// user install locations are scanned in addition to PATH.
+const EXTRA_BIN_DIRS = process.env.HERDR_USAGE_BIN_DIRS === undefined
+  ? [path.join(os.homedir(), ".local", "bin"), "/usr/local/bin"]
+  : process.env.HERDR_USAGE_BIN_DIRS.split(path.delimiter).filter(Boolean);
+
 function findExecutable(command) {
-  const directories = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const directories = [...(process.env.PATH || "").split(path.delimiter).filter(Boolean), ...EXTRA_BIN_DIRS];
   const extensions = process.platform === "win32"
     ? ["", ...(process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";")]
     : [""];
@@ -389,7 +395,51 @@ function ompResult(data) {
 // agy / Antigravity: `agys quota --json` returns one entry per profile whose
 // quota.groups[] each carry their own 5h and weekly window. Quota is consumed
 // per model group, so the group's model names are shown as the row detail.
-const AGY_HOSTS_FILE = path.join(__dirname, "hosts.json");
+// quota.models[] carries the per-model buckets (retrieveUserQuota) which the
+// summary groups do not cover - Gemini and tab-completion models live there.
+const AGY_HOSTS_FILE = process.env.AGY_HOSTS_FILE
+  || path.join(os.homedir(), ".local", "share", "herdr-plugins", "herdr-usage-limits", "hosts.json");
+
+function normalizeModelName(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function agyModelLabel(modelId) {
+  const id = String(modelId || "").toLowerCase();
+  if (id.startsWith("gemini")) return "Gemini models";
+  if (id.includes("claude")) return "Claude models";
+  if (id.includes("gpt")) return "GPT models";
+  if (id.startsWith("tab_")) return "Tab models";
+  return "Other models";
+}
+
+// Clusters per-model buckets that no summary group already reports, so models
+// sharing one limit collapse into a single row.
+function agyModelFamilies(quota) {
+  const covered = [];
+  for (const group of quota?.groups || []) {
+    String(group.description || "").replace(/^Models within this group:\s*/i, "").split(",")
+      .forEach((name) => { const n = normalizeModelName(name); if (n) covered.push(n); });
+  }
+  const families = new Map();
+  for (const bucket of quota?.models || []) {
+    const id = normalizeModelName(bucket?.modelId);
+    if (!id || covered.some((name) => id.includes(name))) continue;
+    const key = `${Math.round(Number(bucket.remainingFraction) * 1e6)}|${bucket.resetTime || ""}`;
+    let family = families.get(key);
+    if (!family) {
+      family = { label: agyModelLabel(bucket.modelId), models: [], bucket };
+      families.set(key, family);
+    }
+    family.models.push(bucket.modelId);
+  }
+  return [...families.values()];
+}
+
+function agyReset(value) {
+  // Go marshals an unset time.Time as 0001-01-01, which must not render as a date.
+  return typeof value === "string" && value.startsWith("0001-") ? null : value || null;
+}
 
 function agyRowsFor(entries, hostLabel) {
   const prefix = hostLabel ? `${hostLabel} · ` : "";
@@ -407,8 +457,14 @@ function agyRowsFor(entries, hostLabel) {
         const remaining = Number(bucket.remainingFraction);
         const used = Number.isFinite(remaining) ? (1 - remaining) * 100 : null;
         rows.push(windowRow(`${prefix}${group.displayName || "group"} · ${bucket.window || "window"}`,
-          used, bucket.resetTime, models ? `Models · ${models}` : null, minutes, bucket.window));
+          used, agyReset(bucket.resetTime), models ? `Models · ${models}` : null, minutes, bucket.window));
       }
+    }
+    for (const family of agyModelFamilies(entry?.quota)) {
+      const remaining = Number(family.bucket.remainingFraction);
+      const used = Number.isFinite(remaining) ? (1 - remaining) * 100 : null;
+      rows.push(windowRow(`${prefix}${family.label} (per-model)`, used, agyReset(family.bucket.resetTime),
+        family.models.length ? `Models · ${family.models.join(", ")}` : null, null, family.bucket.tokenType || null));
     }
   }
   return { rows, accounts };
@@ -448,8 +504,19 @@ function agyRemoteQuery(host) {
   });
 }
 
+function agyBinary() {
+  const name = process.platform === "win32" ? "agys.exe" : "agys";
+  for (const candidate of [path.join(os.homedir(), ".local", "bin", name), `/usr/local/bin/${name}`]) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return "agys";
+}
+
 async function agyUsage() {
-  const data = await run("agys", ["quota", "--json"]);
+  const data = await run(agyBinary(), ["quota", "--json"]);
   const parts = [agyRowsFor(Array.isArray(data) ? data : [data], null)];
   for (const host of agyRemoteHosts()) parts.push(await agyRemoteQuery(host));
   const rows = parts.flatMap((part) => part.rows);
