@@ -18,6 +18,7 @@ const NO_ADAPTER = ["Bu eklentide kota adaptörü yok", "No quota adapter in thi
 const AI_TOOLS = [
   { id: "codex", name: "Codex", command: "codex", note: ["Otomatik kota adaptörü", "Quota adapter available", "Adaptador de cuota disponible"] },
   { id: "omp", name: "Oh My Pi (OMP)", command: "omp", note: ["Bağlı OMP sağlayıcıları için otomatik kota", "Automatic quota data for connected OMP providers", "Cuotas automáticas de proveedores conectados a OMP"] },
+  { id: "agy", name: "agy (Antigravity)", command: "agys", note: ["agys quota ile model grubu kotaları", "Quota per model group via agys quota", "Cuotas por grupo de modelos vía agys quota"] },
   { id: "claude", name: "Claude Code", command: "claude", note: ["OMP veya statusline köprüsü ile kota", "Quotas via OMP or the statusline bridge", "Cuotas mediante OMP o el puente statusline"] },
   { id: "gemini", name: "Gemini CLI", command: "gemini", note: ["Gemini CLI içinde /stats model", "Run /stats model inside Gemini CLI", "Ejecuta /stats model en Gemini CLI"] },
   { id: "amp", name: "Amp", command: "amp", note: ["amp usage ile kredi bakiyesi", "Check credits with amp usage", "Consulta créditos con amp usage"] },
@@ -385,6 +386,79 @@ function ompResult(data) {
   };
 }
 
+// agy / Antigravity: `agys quota --json` returns one entry per profile whose
+// quota.groups[] each carry their own 5h and weekly window. Quota is consumed
+// per model group, so the group's model names are shown as the row detail.
+const AGY_HOSTS_FILE = path.join(__dirname, "hosts.json");
+
+function agyRowsFor(entries, hostLabel) {
+  const prefix = hostLabel ? `${hostLabel} · ` : "";
+  const rows = [];
+  const accounts = [];
+  for (const entry of entries) {
+    const groups = entry?.quota?.groups || [];
+    const profileName = entry?.profileName || "profile";
+    const owner = `${profileName}${entry?.email ? ` (${entry.email})` : ""}`;
+    accounts.push({ name: `${prefix}${owner}`, plan: groups.length ? `${groups.length} model group${groups.length === 1 ? "" : "s"}` : null });
+    for (const group of groups) {
+      const models = String(group.description || "").replace(/^Models within this group:\s*/i, "").trim();
+      for (const bucket of group.buckets || []) {
+        const minutes = bucket.window === "weekly" ? 10_080 : bucket.window === "5h" ? 300 : null;
+        const remaining = Number(bucket.remainingFraction);
+        const used = Number.isFinite(remaining) ? (1 - remaining) * 100 : null;
+        rows.push(windowRow(`${prefix}${group.displayName || "group"} · ${bucket.window || "window"}`,
+          used, bucket.resetTime, models ? `Models · ${models}` : null, minutes, bucket.window));
+      }
+    }
+  }
+  return { rows, accounts };
+}
+
+function agyRemoteHosts() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(AGY_HOSTS_FILE, "utf8"));
+    return Array.isArray(parsed.remote) ? parsed.remote.filter((host) => host && host.target) : [];
+  } catch {
+    return [];
+  }
+}
+
+function agyRemoteQuery(host) {
+  return new Promise((resolve) => {
+    const label = host.label || host.target;
+    const command = host.command || "export PATH=$HOME/.local/bin:$PATH; agys quota --json";
+    let settled = false;
+    let stdout = "";
+    const finish = (value) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+    const child = spawn("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host.target, command],
+      { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    const timer = setTimeout(() => { child.kill(); finish({ rows: [], accounts: [] }); }, 15_000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.on("error", () => finish({ rows: [], accounts: [] }));
+    child.on("close", (code) => {
+      if (code !== 0) return finish({ rows: [], accounts: [] });
+      try {
+        const parsed = JSON.parse(stdout);
+        finish(agyRowsFor(Array.isArray(parsed) ? parsed : [parsed], label));
+      } catch {
+        finish({ rows: [], accounts: [] });
+      }
+    });
+  });
+}
+
+async function agyUsage() {
+  const data = await run("agys", ["quota", "--json"]);
+  const parts = [agyRowsFor(Array.isArray(data) ? data : [data], null)];
+  for (const host of agyRemoteHosts()) parts.push(await agyRemoteQuery(host));
+  const rows = parts.flatMap((part) => part.rows);
+  const accounts = parts.flatMap((part) => part.accounts);
+  if (!rows.length) throw new Error("agys reported no quota groups");
+  return { title: ["agy · Antigravity modelleri", "agy · Antigravity model groups", "agy · grupos de modelos de Antigravity"],
+    rows, accounts };
+}
+
 function claudeSnapshot(data) {
   return { savedAt: Date.now(), rows: [["five_hour", "5h", 300], ["seven_day", "7d", 10080],
     ["spend_limit", "Spend limit", null]].flatMap(([key, label, minutes]) => {
@@ -445,11 +519,11 @@ function isWeekly(row) {
 }
 
 const sections = [];
-const SECTION_KEYS = { codex: "c", omp: "o", claude: "h", gemini: "g", amp: "m", opencode: "w",
+const SECTION_KEYS = { codex: "c", omp: "o", agy: "b", claude: "h", gemini: "g", amp: "m", opencode: "w",
   commandcode: "v", cursor: "u", copilot: "p", aider: "i", hermes: "e", pi: "j", goose: "n",
   crush: "s", kiro: "k", qwen: "y", kimi: "z", llm: "t", ollama: "x", openrouter: "f" };
-const SECTION_NAMES = { codex: "Codex", omp: "OMP", claude: "Claude", openrouter: "OpenRouter" };
-const ADAPTERS = new Set(["codex", "omp", "claude", "openrouter"]);
+const SECTION_NAMES = { codex: "Codex", omp: "OMP", agy: "agy (Antigravity)", claude: "Claude", openrouter: "OpenRouter" };
+const ADAPTERS = new Set(["codex", "omp", "agy", "claude", "openrouter"]);
 const collapsed = new Set(["d", ...detectedTools.filter((tool) => !ADAPTERS.has(tool.id))
   .map((tool) => SECTION_KEYS[tool.id]).filter(Boolean)]);
 for (const tool of detectedTools) {
@@ -675,9 +749,10 @@ async function refresh() {
   const specs = [];
   if (detectedTools.some((tool) => tool.id === "codex")) specs.push(["Codex", codexUsage]);
   if (detectedTools.some((tool) => tool.id === "omp")) specs.push(["OMP", ompUsage]);
+  if (detectedTools.some((tool) => tool.id === "agy")) specs.push(["agy (Antigravity)", agyUsage]);
   if (sections.some(([key]) => key === "h")) specs.push(["Claude", claudeUsage]);
   if (detectedTools.some((tool) => tool.id === "openrouter")) specs.push(["OpenRouter", openrouterUsage]);
-  for (const tool of detectedTools.filter((item) => !["codex", "omp", "claude", "openrouter"].includes(item.id))) {
+  for (const tool of detectedTools.filter((item) => !["codex", "omp", "agy", "claude", "openrouter"].includes(item.id))) {
     specs.push([tool.name, async () => ({ title: tool.name, note: tool.note, info: true })]);
   }
   await Promise.all(specs.map(async ([name, fetcher]) => {
@@ -751,7 +826,12 @@ function start() {
       }
     });
   }
-  refresh();
+  refresh().then(() => {
+    if (!process.stdout.isTTY) {
+      clearInterval(interval);
+      process.exit(0);
+    }
+  });
 }
 
 if (require.main === module) {
