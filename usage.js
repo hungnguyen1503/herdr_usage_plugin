@@ -188,7 +188,7 @@ function codexAppServer() {
     (async () => {
       try {
         await request("initialize", {
-          clientInfo: { name: "herdr-usage-limits", version: "0.7.4" },
+          clientInfo: { name: "herdr-usage-limits", version: "0.7.5" },
           capabilities: {},
         });
         child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
@@ -451,6 +451,7 @@ function agyRowsFor(entries, hostLabel) {
   const prefix = hostLabel ? `${hostLabel} · ` : "";
   const rows = [];
   const accounts = [];
+  let perModel = false;
   for (const entry of entries) {
     const groups = entry?.quota?.groups || [];
     const profileName = entry?.profileName || "profile";
@@ -467,13 +468,14 @@ function agyRowsFor(entries, hostLabel) {
       }
     }
     for (const family of agyModelFamilies(entry?.quota)) {
+      perModel = true;
       const remaining = Number(family.bucket.remainingFraction);
       const used = Number.isFinite(remaining) ? (1 - remaining) * 100 : null;
       rows.push(windowRow(`${prefix}${family.label} (per-model)`, used, agyReset(family.bucket.resetTime),
         family.models.length ? `Models · ${family.models.join(", ")}` : null, null, family.bucket.tokenType || null));
     }
   }
-  return { rows, accounts };
+  return { rows, accounts, perModel };
 }
 
 function agyRemoteHosts() {
@@ -536,8 +538,12 @@ async function agyUsage() {
   const rows = parts.flatMap((part) => part.rows);
   const accounts = parts.flatMap((part) => part.accounts);
   if (!rows.length) throw localError || new Error("agys reported no quota groups");
+  // Upstream agys never reads retrieveUserQuota, so models[] is absent and
+  // Gemini/tab limits stay hidden. Say so instead of silently showing less.
+  const perModel = parts.some((part) => part.perModel);
   return { title: ["agy · Antigravity modelleri", "agy · Antigravity model groups", "agy · grupos de modelos de Antigravity"],
-    rows, accounts };
+    rows, accounts,
+    note: perModel ? null : ["Model başına Gemini/sekme kotaları için agys çatalını kur.", "Per-model Gemini and tab quotas need the agys fork (see the plugin README).", "Las cuotas por modelo de Gemini y pestañas requieren el fork de agys (ver README)."] };
 }
 
 function claudeSnapshot(data) {

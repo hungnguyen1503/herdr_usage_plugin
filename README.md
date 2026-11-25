@@ -2,7 +2,7 @@
 
 [![Platform: Windows / macOS / Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D4)](#install)
 [![Languages: EN / TR / ES](https://img.shields.io/badge/languages-EN%20%7C%20TR%20%7C%20ES-8B5CF6)](#languages)
-[![Release: v0.7.4](https://img.shields.io/badge/release-v0.7.4-orange)](https://github.com/hungnguyen1503/herdr_usage_plugin/tree/v0.7.4)
+[![Release: v0.7.5](https://img.shields.io/badge/release-v0.7.5-orange)](https://github.com/hungnguyen1503/herdr_usage_plugin/tree/v0.7.5)
 [![Fork of tunaunuvar/herdr_usage_plugin](https://img.shields.io/badge/fork-tunaunuvar%2Fherdr__usage__plugin-blue)](https://github.com/tunaunuvar/herdr_usage_plugin)
 [![License: MIT](https://img.shields.io/badge/license-MIT-97CA00)](LICENSE)
 
@@ -70,14 +70,25 @@ The panel uses responsive, bordered quota cards with color-coded usage bars and 
 
 ## agy (Antigravity)
 
-The agy card reads `agys quota --json` and shows, per account profile:
+The agy card reads `agys quota --json` from the [agys fork](https://github.com/hungnguyen1503/agys) and shows, per account profile:
 
 - every pooled model group with its 5-hour and weekly windows (`[WEEKLY]` is marked in the card);
 - the per-model buckets that no group describes (Gemini, tab completion) as `<family> (per-model)` rows, collapsed to one row per shared limit and listing the model IDs.
 
-Per-model rows report only the window the API exposes for them, so a fixed 5-hour reset countdown; there is no per-model weekly figure to show. `agys` reports no reset time for some buckets, which the panel prints as `reset time not reported` instead of a date.
+Per-model rows report only the window the API exposes for them, a fixed 5-hour reset countdown; there is no per-model weekly figure. Buckets with no reported reset print `reset time not reported` instead of a date.
 
-Upstream `agys` (v0.2.40) only reads Antigravity's `retrieveUserQuotaSummary` endpoint, which omits the Gemini and tab buckets entirely. The card therefore needs a patched `agys`; [`patches/agys-per-model-quota.patch`](patches/agys-per-model-quota.patch) adds `quota.models[]` and the per-model table rows:
+Install the fork (it publishes `windows`, `macos` and `linux` builds; upstream `quaywin/agys` builds only the latter two and never reads the per-model endpoint):
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/hungnguyen1503/agys/main/install.sh | bash
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/hungnguyen1503/agys/main/install.ps1 | iex
+```
+
+Both installers place `agys` in `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows). `agys upgrade` follows the fork's releases.
+
+An upstream `agys` build still works and shows the pooled groups; the card then adds a line saying per-model Gemini and tab quotas need the fork. `patches/agys-per-model-quota.patch` is the isolated upstream change if you prefer to build from `quaywin/agys` yourself:
 
 ```sh
 git clone https://github.com/quaywin/agys && cd agys && git checkout v0.2.40
@@ -85,8 +96,6 @@ git apply /path/to/herdr_usage_plugin/patches/agys-per-model-quota.patch
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -X github.com/quaywin/agys/pkg/version.Version=0.2.40-agymodels" -o agys.exe main.go
 # linux/macOS: drop GOOS/GOARCH, use -o agys
 ```
-
-Install the binary as `agys` (`agys.exe` on Windows) in `~/.local/bin`. An unpatched `agys` still works: the panel then shows only the pooled groups. `agys upgrade` reinstalls the upstream binary and hides the per-model rows again.
 
 To read more accounts than the one local `agys` profile, list SSH targets in `<herdr plugin config dir>/hosts.json` (`herdr plugin config-dir tunaunuvar.herdr-usage-limits`):
 
@@ -98,7 +107,7 @@ To read more accounts than the one local `agys` profile, list SSH targets in `<h
 }
 ```
 
-`label` prefixes the remote accounting rows (`rvc · Gemini models (per-model)`); `command` defaults to the line above. `AGY_HOSTS_FILE` overrides the file location. Remote queries use `ssh -o BatchMode=yes` with an 8 s connect and 15 s total budget, so a host that is down or prompts for a password is skipped silently, and an unreachable local profile never hides the remote rows.
+`label` prefixes the remote rows (`rvc · Gemini models (per-model)`); `command` defaults to the line above. `AGY_HOSTS_FILE` overrides the file location. Remote queries use `ssh -o BatchMode=yes` with an 8 s connect and 15 s total budget, so a host that is down or prompts for a password is skipped silently, and an unreachable local profile never hides the remote rows.
 
 ## Languages
 
@@ -150,7 +159,7 @@ To uninstall the GitHub-managed copy, run `herdr plugin uninstall tunaunuvar.her
 
 This fork of [tunaunuvar/herdr_usage_plugin](https://github.com/tunaunuvar/herdr_usage_plugin) adds, on top of upstream v0.7.3:
 
-- an agy (Antigravity) quota card backed by `agys quota --json`, including per-model families and optional remote hosts over SSH;
+- an agy (Antigravity) quota card backed by [`agys`](https://github.com/hungnguyen1503/agys) `quota --json`, including per-model Gemini/tab families and optional remote hosts over SSH;
 - `~/.local/bin` and `/usr/local/bin` in CLI detection and absolute-path spawning of `agys`, because Herdr's server `PATH` often omits user install dirs (`HERDR_USAGE_BIN_DIRS` overrides the list);
 - `node usage.js` in a non-TTY exits after the first refresh, so headless checks finish instead of polling.
 

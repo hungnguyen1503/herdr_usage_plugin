@@ -460,3 +460,14 @@ test("agy remote hosts are read from the herdr plugin config directory", () => {
     } finally { fs.rmSync(legacy, { recursive: true, force: true }); }
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
+
+// Upstream agys never calls retrieveUserQuota, so its JSON has no models[].
+// The card must say the per-model rows are missing instead of hiding them.
+test("agy card flags an agys build without per-model buckets", () => {
+  const context = agyContext();
+  const legacy = { quota: { groups: [{ displayName: "Claude and GPT models", description: "",
+    buckets: [{ window: "5h", remainingFraction: 1, resetTime: "2026-11-25T10:00:00Z" }] }] } };
+  assert.equal(vm.runInContext(`agyRowsFor([${JSON.stringify(legacy)}], null).perModel`, context), false);
+  const patched = { quota: { groups: [], models: [{ modelId: "gemini-3-flash", remainingFraction: 1 }] } };
+  assert.equal(vm.runInContext(`agyRowsFor([${JSON.stringify(patched)}], null).perModel`, context), true);
+});

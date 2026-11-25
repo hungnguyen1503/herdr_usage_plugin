@@ -1,6 +1,6 @@
 id = "tunaunuvar.herdr-usage-limits"
 name = "AI Usage Limits"
-version = "0.7.4"
+version = "0.7.5"
 min_herdr_version = "0.9.0"
 description = "One quota panel detects 20 AI CLIs incl. OpenCode, Command Code, Hermes; live bars for Codex, Claude, OMP, OpenRouter and agy (Antigravity)"
 platforms = ["windows", "macos", "linux"]
