@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Patches must keep LF endings: git apply rejects CRLF context lines.
+patches/*.patch text eol=lf
