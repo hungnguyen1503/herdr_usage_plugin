@@ -1,0 +1,289 @@
+diff --git a/pkg/profile/quota.go b/pkg/profile/quota.go
+index b5a0c83..dea37b7 100644
+--- a/pkg/profile/quota.go
++++ b/pkg/profile/quota.go
+@@ -318,6 +318,30 @@ type QuotaGroup struct {
+ type QuotaSummary struct {
+ 	Groups      []QuotaGroup `json:"groups"`
+ 	Description string       `json:"description"`
++	// Models carries the per-model buckets from retrieveUserQuota. The summary
++	// endpoint only reports pooled groups (e.g. "Claude and GPT models"), so
++	// Gemini and other per-model quotas are only visible here.
++	Models []ModelQuotaBucket `json:"models,omitempty"`
++}
++
++// ModelQuotaBucket is a single per-model quota entry from retrieveUserQuota.
++type ModelQuotaBucket struct {
++	ModelID           string    `json:"modelId"`
++	TokenType         string    `json:"tokenType"`
++	RemainingFraction float64   `json:"remainingFraction"`
++	ResetTime         time.Time `json:"resetTime"`
++}
++
++// ModelQuotaList is the response body of retrieveUserQuota.
++type ModelQuotaList struct {
++	Buckets []ModelQuotaBucket `json:"buckets"`
++}
++
++// ModelFamily is a set of models that share one per-model quota bucket.
++type ModelFamily struct {
++	Name   string
++	Models []string
++	Bucket ModelQuotaBucket
+ }
+ 
+ // ProfileQuotaInfo represents the collected quota data for a specific profile.
+@@ -492,8 +516,10 @@ func formatHTTPError(statusCode int, body []byte) error {
+ // FetchQuota retrieves the quota summary for a specific profile.
+ // It returns fresh cached quota (< 45 seconds old) immediately, or fetches from API and caches the result.
+ func FetchQuota(ctx context.Context, profileName string) (*QuotaSummary, error) {
+-	// 0. Fast-path: Check fresh cache (TTL 45s) for instant 0ms latency
+-	if cached, fresh := GetCachedQuota(profileName, 45*time.Second); fresh && cached != nil {
++	// 0. Fast-path: Check fresh cache (TTL 45s) for instant 0ms latency.
++	// Cached summaries without per-model buckets are treated as misses so an
++	// older/partial cache cannot hide the Gemini and tab-completion quotas.
++	if cached, fresh := GetCachedQuota(profileName, 45*time.Second); fresh && cached != nil && len(cached.Models) > 0 {
+ 		return cached, nil
+ 	}
+ 
+@@ -556,6 +582,9 @@ func FetchQuota(ctx context.Context, profileName string) (*QuotaSummary, error)
+ 	}
+ 
+ 	if err == nil && summary != nil {
++		if models, mErr := retrieveUserQuota(ctx, accessToken, projectID); mErr == nil && len(models) > 0 {
++			summary.Models = models
++		}
+ 		_ = SaveCachedQuota(profileName, summary)
+ 		return summary, nil
+ 	}
+@@ -847,6 +876,157 @@ func retrieveUserQuotaSummary(ctx context.Context, accessToken, projectID string
+ 	return &summary, nil
+ }
+ 
++// retrieveUserQuota fetches the per-model quota buckets. The summary endpoint only
++// pools Claude/GPT models, so this is the only source for Gemini and other models.
++func retrieveUserQuota(ctx context.Context, accessToken, projectID string) ([]ModelQuotaBucket, error) {
++	url := "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
++
++	reqBody := map[string]string{
++		"project": projectID,
++	}
++	bodyBytes, err := json.Marshal(reqBody)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Authorization", "Bearer "+accessToken)
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("User-Agent", "antigravity/1.11.9 darwin/arm64")
++
++	resp, err := httpClient.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		body, _ := io.ReadAll(resp.Body)
++		return nil, formatHTTPError(resp.StatusCode, body)
++	}
++
++	var list ModelQuotaList
++	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
++		return nil, err
++	}
++
++	return list.Buckets, nil
++}
++
++// GroupDescriptionModels extracts the model names listed in a group description
++// ("Models within this group: A, B, C").
++func GroupDescriptionModels(description string) []string {
++	desc := description
++	if idx := strings.Index(strings.ToLower(desc), "models within this group:"); idx >= 0 {
++		desc = desc[idx+len("models within this group:"):]
++	}
++	var out []string
++	for _, name := range strings.Split(desc, ",") {
++		if name = strings.TrimSpace(name); name != "" && len(out) < 64 {
++			out = append(out, name)
++		}
++	}
++	return out
++}
++
++// normalizeModelName lowercases a model label and drops every non-alphanumeric
++// rune, so "Claude Opus 4.6" and "claude-opus-4-6-thinking" can be compared.
++func normalizeModelName(name string) string {
++	var b strings.Builder
++	for _, r := range strings.ToLower(name) {
++		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
++			b.WriteRune(r)
++		}
++	}
++	return b.String()
++}
++
++// CoveredModels returns the normalized model names already reported by the summary groups.
++func CoveredModels(summary *QuotaSummary) map[string]bool {
++	covered := make(map[string]bool)
++	if summary == nil {
++		return covered
++	}
++	for _, group := range summary.Groups {
++		for _, name := range GroupDescriptionModels(group.Description) {
++			if n := normalizeModelName(name); n != "" {
++				covered[n] = true
++			}
++		}
++	}
++	return covered
++}
++
++// modelCovered reports whether a per-model bucket is already described by a summary group.
++func modelCovered(modelID string, covered map[string]bool) bool {
++	id := normalizeModelName(modelID)
++	if id == "" {
++		return true
++	}
++	for name := range covered {
++		if strings.Contains(id, name) {
++			return true
++		}
++	}
++	return false
++}
++
++// uncoveredModelFamilies clusters per-model buckets that no summary group covers,
++// so the table and the herdr panel can show them as one row per shared limit.
++func uncoveredModelFamilies(summary *QuotaSummary) []ModelFamily {
++	if summary == nil || len(summary.Models) == 0 {
++		return nil
++	}
++	covered := CoveredModels(summary)
++
++	type clusterKey struct {
++		fraction int64
++		reset    int64
++	}
++	var order []clusterKey
++	families := make(map[clusterKey]*ModelFamily)
++
++	for _, bucket := range summary.Models {
++		id := strings.TrimSpace(bucket.ModelID)
++		if id == "" || modelCovered(id, covered) {
++			continue
++		}
++		key := clusterKey{fraction: int64(bucket.RemainingFraction * 1e6), reset: bucket.ResetTime.Unix()}
++		family, ok := families[key]
++		if !ok {
++			family = &ModelFamily{Name: ModelFamilyName(id), Bucket: bucket}
++			families[key] = family
++			order = append(order, key)
++		}
++		family.Models = append(family.Models, id)
++	}
++
++	out := make([]ModelFamily, 0, len(order))
++	for _, key := range order {
++		out = append(out, *families[key])
++	}
++	return out
++}
++
++// ModelFamilyName maps a model ID to the family label shown in quota output.
++func ModelFamilyName(modelID string) string {
++	id := strings.ToLower(strings.TrimSpace(modelID))
++	switch {
++	case strings.HasPrefix(id, "gemini"):
++		return "Gemini models"
++	case strings.Contains(id, "claude"):
++		return "Claude models"
++	case strings.Contains(id, "gpt"):
++		return "GPT models"
++	case strings.HasPrefix(id, "tab_"):
++		return "Tab models"
++	}
++	return "Other models"
++}
++
+ // FormatResetTime formats a reset timestamp into a human-readable remaining time string.
+ func FormatResetTime(resetTime time.Time, fraction float64) string {
+ 	if fraction >= 1.0 || resetTime.IsZero() {
+@@ -1056,6 +1236,13 @@ func RenderQuotaTable(w io.Writer, results []ProfileQuotaInfo, currentProfile st
+ 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+ 				dispProfile, dispPrio, dispEmail, dispConfig, group.DisplayName, q5h, r5h, qWeekly, rWeekly)
+ 		}
++
++		for _, family := range uncoveredModelFamilies(res.Quota) {
++			pct := family.Bucket.RemainingFraction * 100
++			bar := ProgressBar(family.Bucket.RemainingFraction, 10)
++			fmt.Fprintf(tw, "\t\t\t\t%s (per-model)\t%5.1f%% [%s]\t%s\tN/A\t-\n",
++				family.Name, pct, bar, FormatResetTime(family.Bucket.ResetTime, family.Bucket.RemainingFraction))
++		}
+ 	}
+ 
+ 	tw.Flush()
+diff --git a/pkg/profile/quota_test.go b/pkg/profile/quota_test.go
+index 4ad9bfd..9dc8b4b 100644
+--- a/pkg/profile/quota_test.go
++++ b/pkg/profile/quota_test.go
+@@ -395,3 +395,54 @@ func TestGetProfileFullQuotaDetailsFast_FreshAndStale(t *testing.T) {
+ 	}
+ }
+ 
++func TestUncoveredModelFamilies(t *testing.T) {
++	reset := time.Date(2026, 11, 25, 4, 35, 0, 0, time.UTC)
++	summary := &QuotaSummary{
++		Groups: []QuotaGroup{{
++			DisplayName: "Claude and GPT models",
++			Description: "Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B",
++		}},
++		Models: []ModelQuotaBucket{
++			{ModelID: "claude-sonnet-4-6", RemainingFraction: 1},
++			{ModelID: "claude-opus-4-6-thinking", RemainingFraction: 1},
++			{ModelID: "gpt-oss-120b-medium", RemainingFraction: 1},
++			{ModelID: "gemini-3-flash", RemainingFraction: 0.875, ResetTime: reset},
++			{ModelID: "gemini-3.8-flash-tiered", RemainingFraction: 0.875, ResetTime: reset},
++			{ModelID: "tab_flash_lite_preview", RemainingFraction: 1},
++		},
++	}
++
++	families := uncoveredModelFamilies(summary)
++	if len(families) != 2 {
++		t.Fatalf("expected 2 families (gemini + tab), got %d: %+v", len(families), families)
++	}
++	if families[0].Name != "Gemini models" || len(families[0].Models) != 2 {
++		t.Errorf("unexpected first family: %+v", families[0])
++	}
++	if families[0].Bucket.RemainingFraction != 0.875 || !families[0].Bucket.ResetTime.Equal(reset) {
++		t.Errorf("unexpected gemini bucket: %+v", families[0].Bucket)
++	}
++	if families[1].Name != "Tab models" || len(families[1].Models) != 1 {
++		t.Errorf("unexpected second family: %+v", families[1])
++	}
++
++	cached := &QuotaSummary{Groups: summary.Groups}
++	if got := uncoveredModelFamilies(cached); got != nil {
++		t.Errorf("expected no families without models, got %+v", got)
++	}
++}
++
++func TestModelFamilyName(t *testing.T) {
++	cases := map[string]string{
++		"gemini-2.5-pro":              "Gemini models",
++		"claude-opus-5-5-medium":      "Claude models",
++		"gpt-oss-120b-medium":         "GPT models",
++		"tab_jump_flash_lite_preview": "Tab models",
++		"mystery-model":               "Other models",
++	}
++	for id, want := range cases {
++		if got := ModelFamilyName(id); got != want {
++			t.Errorf("ModelFamilyName(%q) = %q, want %q", id, got, want)
++		}
++	}
++}

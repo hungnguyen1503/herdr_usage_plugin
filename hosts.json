@@ -1,9 +1,3 @@
 {
-  "remote": [
-    {
-      "label": "rvc",
-      "target": "rvcadmin@10.231.9.140",
-      "command": "export PATH=$HOME/.local/bin:$PATH; agys quota --json"
-    }
-  ]
+  "remote": []
 }

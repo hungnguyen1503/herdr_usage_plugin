@@ -188,7 +188,7 @@ function codexAppServer() {
     (async () => {
       try {
         await request("initialize", {
-          clientInfo: { name: "herdr-usage-limits", version: "0.7.3" },
+          clientInfo: { name: "herdr-usage-limits", version: "0.7.4" },
           capabilities: {},
         });
         child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
@@ -397,8 +397,14 @@ function ompResult(data) {
 // per model group, so the group's model names are shown as the row detail.
 // quota.models[] carries the per-model buckets (retrieveUserQuota) which the
 // summary groups do not cover - Gemini and tab-completion models live there.
-const AGY_HOSTS_FILE = process.env.AGY_HOSTS_FILE
-  || path.join(os.homedir(), ".local", "share", "herdr-plugins", "herdr-usage-limits", "hosts.json");
+// Remote agys hosts are optional. Herdr exports HERDR_PLUGIN_CONFIG_DIR for the
+// pane, so `<config dir>/hosts.json` is the documented location; the plugin
+// checkout's own hosts.json is the fallback for local development.
+const AGY_HOSTS_FILES = [
+  process.env.AGY_HOSTS_FILE,
+  process.env.HERDR_PLUGIN_CONFIG_DIR && path.join(process.env.HERDR_PLUGIN_CONFIG_DIR, "hosts.json"),
+  typeof __dirname === "string" && path.join(__dirname, "hosts.json"),
+].filter(Boolean);
 
 function normalizeModelName(name) {
   return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -471,12 +477,13 @@ function agyRowsFor(entries, hostLabel) {
 }
 
 function agyRemoteHosts() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(AGY_HOSTS_FILE, "utf8"));
-    return Array.isArray(parsed.remote) ? parsed.remote.filter((host) => host && host.target) : [];
-  } catch {
-    return [];
+  for (const file of AGY_HOSTS_FILES) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (Array.isArray(parsed.remote)) return parsed.remote.filter((host) => host && host.target);
+    } catch { /* Try the next location. */ }
   }
+  return [];
 }
 
 function agyRemoteQuery(host) {
@@ -516,12 +523,19 @@ function agyBinary() {
 }
 
 async function agyUsage() {
-  const data = await run(agyBinary(), ["quota", "--json"]);
-  const parts = [agyRowsFor(Array.isArray(data) ? data : [data], null)];
-  for (const host of agyRemoteHosts()) parts.push(await agyRemoteQuery(host));
+  const parts = [];
+  let localError = null;
+  try {
+    const data = await run(agyBinary(), ["quota", "--json"]);
+    parts.push(agyRowsFor(Array.isArray(data) ? data : [data], null));
+  } catch (error) {
+    localError = error;
+  }
+  const hosts = agyRemoteHosts();
+  for (const host of hosts) parts.push(await agyRemoteQuery(host));
   const rows = parts.flatMap((part) => part.rows);
   const accounts = parts.flatMap((part) => part.accounts);
-  if (!rows.length) throw new Error("agys reported no quota groups");
+  if (!rows.length) throw localError || new Error("agys reported no quota groups");
   return { title: ["agy · Antigravity modelleri", "agy · Antigravity model groups", "agy · grupos de modelos de Antigravity"],
     rows, accounts };
 }

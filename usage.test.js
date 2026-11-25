@@ -391,3 +391,72 @@ test("interactive startup uses one refresh timer and restores the terminal on cl
   assert.ok(writes.at(-1).includes("\x1b[?25h\x1b[?1049l"));
   input.destroy();
 });
+
+function agyContext(env = {}) {
+  const context = vm.createContext({
+    require: (name) => name === "node:child_process" ? { spawn() { throw new Error("Rendering must not launch a CLI"); } } : require(name),
+    module: {},
+    process: { env: { PATH: "", HERDR_USAGE_BIN_DIRS: "", ...env }, platform: process.platform,
+      stdout: { isTTY: false }, stdin: { isTTY: false } },
+    setInterval() { throw new Error("Importing the renderer must not start polling"); }, setTimeout, clearTimeout,
+  });
+  vm.runInContext(source, context);
+  return context;
+}
+
+// Gemini and tab-completion limits only exist in quota.models[]; the summary
+// groups that cover Claude/GPT models must not be repeated as per-model rows.
+test("agy per-model buckets collapse into families that groups do not cover", () => {
+  const context = agyContext();
+  const quota = {
+    groups: [{
+      displayName: "Claude and GPT models",
+      description: "Models within this group: Claude Opus 4.6, Claude Sonnet 4.6, GPT-OSS 120B",
+      buckets: [{ window: "5h", remainingFraction: 1, resetTime: "2026-11-25T10:00:00Z" },
+        { window: "weekly", remainingFraction: 1, resetTime: "2026-12-02T10:00:00Z" }],
+    }],
+    models: [
+      { modelId: "claude-opus-4-6-thinking", remainingFraction: 1, resetTime: "2026-11-25T10:00:00Z" },
+      { modelId: "gemini-3-flash", remainingFraction: 0.45, resetTime: "2026-11-25T09:00:00Z" },
+      { modelId: "gemini-2.5-pro", remainingFraction: 0.45, resetTime: "2026-11-25T09:00:00Z" },
+      { modelId: "tab_flash_lite_preview", remainingFraction: 1, resetTime: "0001-01-01T00:00:00Z" },
+    ],
+  };
+  const families = JSON.parse(JSON.stringify(
+    vm.runInContext(`agyModelFamilies(${JSON.stringify(quota)})`, context)));
+  assert.deepEqual(families.map((family) => family.label), ["Gemini models", "Tab models"]);
+  assert.equal(families[0].models.length, 2, "models sharing one limit share one row");
+  assert.equal(families[1].models.length, 1);
+  assert.equal(vm.runInContext(`agyModelFamilies(${JSON.stringify({ groups: [], models: [] })}).length`, context), 0);
+  assert.equal(vm.runInContext('agyReset("0001-01-01T00:00:00Z")', context), null);
+  assert.equal(vm.runInContext('agyReset("2026-11-25T09:00:00Z")', context), "2026-11-25T09:00:00Z");
+  const rows = JSON.parse(JSON.stringify(
+    vm.runInContext(`agyRowsFor([{ profileName: "laptop", quota: ${JSON.stringify(quota)} }], "rvc").rows`, context)));
+  assert.deepEqual(rows.map((row) => row.label), [
+    "rvc · Claude and GPT models · 5h", "rvc · Claude and GPT models · weekly",
+    "rvc · Gemini models (per-model)", "rvc · Tab models (per-model)"]);
+  assert.equal(rows.at(-1).resetsAt, null, "Go's zero time must not render as a reset date");
+  assert.equal(Math.round(rows[2].used), 55);
+});
+
+test("agy remote hosts are read from the herdr plugin config directory", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-agy-hosts-"));
+  try {
+    fs.writeFileSync(path.join(directory, "hosts.json"), JSON.stringify({
+      remote: [{ label: "rvc", target: "user@example" }, { target: "" }],
+    }));
+    const context = agyContext({ HERDR_PLUGIN_CONFIG_DIR: directory });
+    assert.equal(vm.runInContext("agyRemoteHosts().length", context), 1);
+    assert.equal(vm.runInContext("agyRemoteHosts()[0].target", context), "user@example");
+    // The plugin config dir wins over any legacy copy next to the checkout.
+    const legacy = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-agy-legacy-"));
+    try {
+      fs.writeFileSync(path.join(legacy, "hosts.json"), JSON.stringify({ remote: [{ target: "legacy@example" }] }));
+      const both = agyContext({ HERDR_PLUGIN_CONFIG_DIR: directory, AGY_HOSTS_FILE: path.join(directory, "hosts.json") });
+      assert.equal(vm.runInContext("agyRemoteHosts()[0].target", both), "user@example");
+      fs.writeFileSync(path.join(directory, "hosts.json"), "not json");
+      const fallback = agyContext({ HERDR_PLUGIN_CONFIG_DIR: directory, AGY_HOSTS_FILE: path.join(directory, "missing.json") });
+      assert.equal(vm.runInContext("agyRemoteHosts().length", fallback), 0, "unreadable config files must not crash the panel");
+    } finally { fs.rmSync(legacy, { recursive: true, force: true }); }
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
